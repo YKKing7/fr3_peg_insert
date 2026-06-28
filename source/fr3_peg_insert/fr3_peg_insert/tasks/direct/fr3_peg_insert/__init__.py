@@ -13,7 +13,7 @@ from . import agents
 
 
 gym.register(
-    id="Template-Fr3-Peg-Insert-Direct-v0",
+    id="Isaac-Fr3-Peg-Insert-Direct-v0",
     entry_point=f"{__name__}.fr3_peg_insert_env:Fr3PegInsertEnv",
     disable_env_checker=True,
     kwargs={

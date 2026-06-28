@@ -1,135 +1,115 @@
-# Template for Isaac Lab Projects
+# FR3 Peg Insert
 
-## Overview
+<div align="center">
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Isaac Lab](https://img.shields.io/badge/Isaac%20Lab-Direct%20RL-76B900.svg)](https://github.com/isaac-sim/IsaacLab)
+[![RL--Games](https://img.shields.io/badge/RL--Games-PPO-orange.svg)](https://github.com/Denys88/rl_games)
+[![CUDA](https://img.shields.io/badge/CUDA-Recommended-76B900.svg)](https://developer.nvidia.com/cuda-zone)
 
-**Key Features:**
+</div>
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
+基于 NVIDIA Isaac Lab 的 Franka FR3 插孔强化学习环境。任务中，FR3 夹持 20 mm 圆柱 peg，并将其插入 23 mm 圆孔 fixture，用于学习接触丰富的 peg-in-hole 装配策略。
 
-**Keywords:** extension, template, isaaclab
+<div align="center">
+  <img src="./demo.webp" width="640px" alt="FR3 peg insertion rollout demo">
+</div>
 
-## Installation
+## 概览
 
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
+- **Task ID**：`Isaac-Fr3-Peg-Insert-Direct-v0`
+- **仿真设置**：120 Hz，decimation 8，默认 128 个并行环境，episode 长度 10 s
+- **控制方式**：策略输出 6D 末端增量，底层任务空间阻抗控制生成关节力矩
+- **训练方式**：RL-Games PPO + LSTM，非对称 actor-critic
+- **随机化**：reset 时随机 hole 平面位置、yaw，以及 peg 在夹爪中的初始位置
+- **成功判定**：peg 底部水平误差小于 `5 mm`，高度低于 `success_threshold` 阈值
 
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
+核心代码位于：
 
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
+```text
+source/fr3_peg_insert/fr3_peg_insert/tasks/direct/fr3_peg_insert/
+```
 
-    ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/fr3_peg_insert
+## 安装
 
-- Verify that the extension is correctly installed by:
+先安装 Isaac Lab：
 
-    - Listing the available tasks:
+<https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html>
 
-        Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
-        (in the `scripts/list_envs.py` file) so that it can be listed.
+安装本扩展：
 
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/list_envs.py
-        ```
+```bash
+python -m pip install -e source/fr3_peg_insert
+```
 
-    - Running a task:
+若使用 Isaac Lab launcher：
 
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
+```bash
+PATH_TO_isaaclab.bat -p -m pip install -e source/fr3_peg_insert
+```
 
-    - Running a task with dummy agents:
+Linux 环境将 `isaaclab.bat` 替换为 `isaaclab.sh`。
 
-        These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
+## 快速验证
 
-        - Zero-action agent
+```bash
+python scripts/list_envs.py --keyword Fr3
+python scripts/zero_agent.py --task Isaac-Fr3-Peg-Insert-Direct-v0 --num_envs 16
+python scripts/random_agent.py --task Isaac-Fr3-Peg-Insert-Direct-v0 --num_envs 16
+```
 
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/zero_agent.py --task=<TASK_NAME>
-            ```
-        - Random-action agent
+## 训练
 
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/random_agent.py --task=<TASK_NAME>
-            ```
+```bash
+python scripts/rl_games/train.py \
+  --task Isaac-Fr3-Peg-Insert-Direct-v0 \
+  --num_envs 128 \
+  --max_iterations 200
+```
 
-### Set up IDE (Optional)
+日志默认保存在 `logs/rl_games/Factory/<experiment_name>/`。
 
-To setup the IDE, please follow these instructions:
+## 回放
 
-- Run VSCode Tasks, by pressing `Ctrl+Shift+P`, selecting `Tasks: Run Task` and running the `setup_python_env` in the drop down menu.
-  When running this task, you will be prompted to add the absolute path to your Isaac Sim installation.
+```bash
+python scripts/rl_games/play.py \
+  --task Isaac-Fr3-Peg-Insert-Direct-v0 \
+  --checkpoint logs/rl_games/Factory/test/nn/Factory.pth \
+  --num_envs 16 \
+  --real-time
+```
 
-If everything executes correctly, it should create a file .python.env in the `.vscode` directory.
-The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
-This helps in indexing all the python modules for intelligent suggestions while writing code.
+## 评估
 
-### Setup as Omniverse Extension (Optional)
+```bash
+python scripts/rl_games/test_success_rate.py \
+  --task Isaac-Fr3-Peg-Insert-Direct-v0 \
+  --checkpoint logs/rl_games/Factory/test/nn/Factory.pth \
+  --num_envs 128 \
+  --num_episodes 1024
+```
 
-We provide an example UI extension that will load upon enabling your extension defined in `source/fr3_peg_insert/fr3_peg_insert/ui_extension_example.py`.
+## 配置入口
 
-To enable your extension, follow these steps:
+| 文件 | 说明 |
+| --- | --- |
+| `fr3_peg_insert_env.py` | Direct RL 环境、奖励、reset 和成功判定 |
+| `fr3_peg_insert_env_cfg.py` | 机器人、资产、随机化、仿真和控制参数 |
+| `control.py` | 任务空间控制与 IK 工具 |
+| `utils.py` | 观测拼接、关键点、资产位姿和物理属性辅助函数 |
+| `agents/rl_games_ppo_cfg.yaml` | RL-Games PPO/LSTM 训练配置 |
 
-1. **Add the search path of this project/repository** to the extension manager:
-    - Navigate to the extension manager using `Window` -> `Extensions`.
-    - Click on the **Hamburger Icon**, then go to `Settings`.
-    - In the `Extension Search Paths`, enter the absolute path to the `source` directory of this project/repository.
-    - If not already present, in the `Extension Search Paths`, enter the path that leads to Isaac Lab's extension directory directory (`IsaacLab/source`)
-    - Click on the **Hamburger Icon**, then click `Refresh`.
-
-2. **Search and enable your extension**:
-    - Find your extension under the `Third Party` category.
-    - Toggle it to enable your extension.
-
-## Code formatting
-
-We have a pre-commit template to automatically format your code.
-To install pre-commit:
+## 开发
 
 ```bash
 pip install pre-commit
-```
-
-Then you can run pre-commit with:
-
-```bash
 pre-commit run --all-files
 ```
 
-## Troubleshooting
+## 参考
 
-### Pylance Missing Indexing of Extensions
-
-In some VsCode versions, the indexing of part of the extensions is missing.
-In this case, add the path to your extension in `.vscode/settings.json` under the key `"python.analysis.extraPaths"`.
-
-```json
-{
-    "python.analysis.extraPaths": [
-        "<path-to-ext-repo>/source/fr3_peg_insert"
-    ]
-}
-```
-
-### Pylance Crash
-
-If you encounter a crash in `pylance`, it is probable that too many files are indexed and you run out of memory.
-A possible solution is to exclude some of omniverse packages that are not used in your project.
-To do so, modify `.vscode/settings.json` and comment out packages under the key `"python.analysis.extraPaths"`
-Some examples of packages that can likely be excluded are:
-
-```json
-"<path-to-isaac-sim>/extscache/omni.anim.*"         // Animation packages
-"<path-to-isaac-sim>/extscache/omni.kit.*"          // Kit UI tools
-"<path-to-isaac-sim>/extscache/omni.graph.*"        // Graph UI tools
-"<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
-...
-```
+- Isaac Lab: <https://github.com/isaac-sim/IsaacLab>
+- RL-Games: <https://github.com/Denys88/rl_games>
+- ManiSkill: <https://github.com/haosulab/ManiSkill>
+- RoboCasa: <https://github.com/robocasa/robocasa>
+- LeRobot: <https://github.com/huggingface/lerobot>
