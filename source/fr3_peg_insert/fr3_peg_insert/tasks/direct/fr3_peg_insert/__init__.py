@@ -21,3 +21,13 @@ gym.register(
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
     },
 )
+
+gym.register(
+    id="Isaac-Fr3-Peg-Insert-Visuomotor-Direct-v0",
+    entry_point=f"{__name__}.fr3_peg_insert_env:Fr3PegInsertEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.fr3_peg_insert_env_cfg:Fr3PegInsertVisuomotorEnvCfg",
+        "robomimic_bc_cfg_entry_point": f"{agents.__name__}:bc_rnn_image_200.json",
+    },
+)

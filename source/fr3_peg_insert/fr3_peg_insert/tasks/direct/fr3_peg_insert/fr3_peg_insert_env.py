@@ -12,12 +12,13 @@ import isaacsim.core.utils.torch as torch_utils
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
+from isaaclab.sensors import TiledCamera
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import axis_angle_from_quat
+from isaaclab.utils.math import axis_angle_from_quat, convert_camera_frame_orientation_convention
 
 from . import control, utils
-from .fr3_peg_insert_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, Fr3PegInsertEnvCfg
+from .fr3_peg_insert_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, Fr3PegInsertEnvCfg, Fr3PegInsertVisuomotorEnvCfg
 
 
 class Fr3PegInsertEnv(DirectRLEnv):
@@ -29,6 +30,13 @@ class Fr3PegInsertEnv(DirectRLEnv):
         cfg.state_space = sum([STATE_DIM_CFG[state] for state in cfg.state_order])
         cfg.observation_space += cfg.action_space
         cfg.state_space += cfg.action_space
+        self._use_visuomotor_obs = isinstance(cfg, Fr3PegInsertVisuomotorEnvCfg)
+        if self._use_visuomotor_obs:
+            cfg.observation_space = {
+                "proprio": cfg.observation_space,
+                "table_cam": [cfg.table_camera.height, cfg.table_camera.width, 3],
+                "wrist_cam": [cfg.wrist_camera.height, cfg.wrist_camera.width, 3],
+            }
         self.cfg_task = cfg.task
 
         super().__init__(cfg, render_mode, **kwargs)
@@ -60,10 +68,17 @@ class Fr3PegInsertEnv(DirectRLEnv):
         # Control targets.
         self.ctrl_target_joint_pos = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
         self.ema_factor = self.cfg.ctrl.ema_factor
+        self.dead_zone_thresholds = None
 
         # Fixed asset.
         self.fixed_pos_obs_frame = torch.zeros((self.num_envs, 3), device=self.device)
         self.init_fixed_pos_obs_noise = torch.zeros((self.num_envs, 3), device=self.device)
+
+        # Episode-level random transform from TCP attachment frame to held asset.
+        self.held_asset_attach_delta_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        self.held_asset_attach_delta_quat = (
+            torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        )
 
         # Computer body indices.
         self.left_finger_body_idx = self._robot.body_names.index("fr3_leftfinger")
@@ -94,6 +109,9 @@ class Fr3PegInsertEnv(DirectRLEnv):
         self._robot = Articulation(self.cfg.robot)
         self._fixed_asset = Articulation(self.cfg_task.fixed_asset)
         self._held_asset = Articulation(self.cfg_task.held_asset)
+        if self._use_visuomotor_obs:
+            self._table_camera = TiledCamera(self.cfg.table_camera)
+            self._wrist_camera = TiledCamera(self.cfg.wrist_camera)
 
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
@@ -103,10 +121,30 @@ class Fr3PegInsertEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self._robot
         self.scene.articulations["fixed_asset"] = self._fixed_asset
         self.scene.articulations["held_asset"] = self._held_asset
+        if self._use_visuomotor_obs:
+            self.scene.sensors["table_cam"] = self._table_camera
+            self.scene.sensors["wrist_cam"] = self._wrist_camera
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+    def _refresh_camera_views(self):
+        """Re-apply configured camera local transforms."""
+        for camera_cfg in (self.cfg.table_camera, self.cfg.wrist_camera):
+            rot = torch.tensor([camera_cfg.offset.rot], dtype=torch.float32, device="cpu")
+            rot_opengl = convert_camera_frame_orientation_convention(
+                rot, origin=camera_cfg.offset.convention, target="opengl"
+            )[0]
+            translation = tuple(float(value) for value in camera_cfg.offset.pos)
+            orientation = tuple(float(value) for value in rot_opengl)
+
+            camera_prims = sim_utils.find_matching_prims(camera_cfg.prim_path)
+            if len(camera_prims) == 0:
+                raise RuntimeError(f"Could not find camera prims matching path: {camera_cfg.prim_path}")
+
+            for prim in camera_prims:
+                sim_utils.standardize_xform_ops(prim, translation=translation, orientation=orientation)
 
     def _compute_intermediate_values(self, dt):
         """Get values computed from raw tensors. This includes adding noise."""
@@ -155,6 +193,7 @@ class Fr3PegInsertEnv(DirectRLEnv):
         noisy_fixed_pos = self.fixed_pos_obs_frame + self.init_fixed_pos_obs_noise
 
         prev_actions = self.actions.clone()
+        held_axis, fixed_axis = self._get_asset_axes()
 
         obs_dict = {
             "fingertip_pos": self.fingertip_midpoint_pos,
@@ -162,6 +201,7 @@ class Fr3PegInsertEnv(DirectRLEnv):
             "fingertip_quat": self.fingertip_midpoint_quat,
             "ee_linvel": self.ee_linvel_fd,
             "ee_angvel": self.ee_angvel_fd,
+            "held_axis_rel_fixed_axis": held_axis - fixed_axis,
             "prev_actions": prev_actions,
         }
 
@@ -190,6 +230,20 @@ class Fr3PegInsertEnv(DirectRLEnv):
 
         obs_tensors = utils.collapse_obs_dict(obs_dict, self.cfg.obs_order + ["prev_actions"])
         state_tensors = utils.collapse_obs_dict(state_dict, self.cfg.state_order + ["prev_actions"])
+        if self._use_visuomotor_obs:
+            table_cam = self._table_camera.data.output["rgb"].float() / 255.0
+            wrist_cam = self._wrist_camera.data.output["rgb"].float() / 255.0
+            # normalize the camera data for better training results
+            table_cam -= torch.mean(table_cam, dim=(1, 2), keepdim=True)
+            wrist_cam -= torch.mean(wrist_cam, dim=(1, 2), keepdim=True)
+            return {
+                "policy": {
+                    "proprio": obs_tensors,
+                    "table_cam": table_cam,
+                    "wrist_cam": wrist_cam,
+                },
+                "critic": state_tensors,
+            }
         return {"policy": obs_tensors, "critic": state_tensors}
 
     def _reset_buffers(self, env_ids):
@@ -228,14 +282,6 @@ class Fr3PegInsertEnv(DirectRLEnv):
             torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1),
         )
         ctrl_target_fingertip_midpoint_quat = torch_utils.quat_mul(rot_actions_quat, self.fingertip_midpoint_quat)
-
-        target_euler_xyz = torch.stack(torch_utils.get_euler_xyz(ctrl_target_fingertip_midpoint_quat), dim=1)
-        target_euler_xyz[:, 0] = 3.14159
-        target_euler_xyz[:, 1] = 0.0
-
-        ctrl_target_fingertip_midpoint_quat = torch_utils.quat_from_euler_xyz(
-            roll=target_euler_xyz[:, 0], pitch=target_euler_xyz[:, 1], yaw=target_euler_xyz[:, 2]
-        )
 
         self.generate_ctrl_signals(
             ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
@@ -278,14 +324,6 @@ class Fr3PegInsertEnv(DirectRLEnv):
         )
         ctrl_target_fingertip_midpoint_quat = torch_utils.quat_mul(rot_actions_quat, self.fingertip_midpoint_quat)
 
-        target_euler_xyz = torch.stack(torch_utils.get_euler_xyz(ctrl_target_fingertip_midpoint_quat), dim=1)
-        target_euler_xyz[:, 0] = 3.14159  # Restrict actions to be upright.
-        target_euler_xyz[:, 1] = 0.0
-
-        ctrl_target_fingertip_midpoint_quat = torch_utils.quat_from_euler_xyz(
-            roll=target_euler_xyz[:, 0], pitch=target_euler_xyz[:, 1], yaw=target_euler_xyz[:, 2]
-        )
-
         self.generate_ctrl_signals(
             ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
             ctrl_target_fingertip_midpoint_quat=ctrl_target_fingertip_midpoint_quat,
@@ -296,7 +334,7 @@ class Fr3PegInsertEnv(DirectRLEnv):
         self, ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, ctrl_target_gripper_dof_pos
     ):
         """Get Jacobian. Set Franka DOF position targets (fingers) or DOF torques (arm)."""
-        self.joint_torque, _ = control.compute_dof_torque(
+        self.joint_torque, self.applied_wrench = control.compute_dof_torque(
             cfg=self.cfg,
             dof_pos=self.joint_pos,
             dof_vel=self.joint_vel,
@@ -311,6 +349,7 @@ class Fr3PegInsertEnv(DirectRLEnv):
             task_prop_gains=self.task_prop_gains,
             task_deriv_gains=self.task_deriv_gains,
             device=self.device,
+            dead_zone_thresholds=self.dead_zone_thresholds,
         )
 
         # set target for gripper joints to use physx's PD controller
@@ -332,8 +371,6 @@ class Fr3PegInsertEnv(DirectRLEnv):
 
     def _get_curr_successes(self, success_threshold):
         """Get success mask at current timestep."""
-        curr_successes = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
-
         held_base_pos, held_base_quat = utils.get_held_base_pose(
             self.held_pos, self.held_quat, self.num_envs, self.device
         )
@@ -343,20 +380,27 @@ class Fr3PegInsertEnv(DirectRLEnv):
             self.num_envs,
             self.device,
         )
+        held_axis, fixed_axis = self._get_asset_axes()
 
         xy_dist = torch.linalg.vector_norm(target_held_base_pos[:, 0:2] - held_base_pos[:, 0:2], dim=1)
         z_disp = held_base_pos[:, 2] - target_held_base_pos[:, 2]
+        axis_alignment = torch.sum(held_axis * fixed_axis, dim=-1).abs()
 
-        is_centered = torch.where(xy_dist < 0.005, torch.ones_like(curr_successes), torch.zeros_like(curr_successes))
-        # Height threshold to target
-        fixed_cfg = self.cfg_task.fixed_asset_cfg
-        height_threshold = fixed_cfg.height * success_threshold
-        is_close_or_below = torch.where(
-            z_disp < height_threshold, torch.ones_like(curr_successes), torch.zeros_like(curr_successes)
-        )
-        curr_successes = torch.logical_and(is_centered, is_close_or_below)
+        self.extras["mean_xy_dist"] = xy_dist.mean()
+        self.extras["mean_z_disp"] = z_disp.mean()
+        self.extras["mean_axis_alignment"] = axis_alignment.mean()
 
-        return curr_successes
+        is_centered = xy_dist < 0.005
+        height_threshold = self.cfg_task.fixed_asset_cfg.height * success_threshold
+        is_close_or_below = z_disp < height_threshold
+        is_axis_aligned = axis_alignment > self.cfg_task.success_axis_threshold
+
+        if success_threshold == self.cfg_task.success_threshold:
+            self.extras["xy_success_rate"] = is_centered.float().mean()
+            self.extras["z_success_rate"] = is_close_or_below.float().mean()
+            self.extras["axis_success_rate"] = is_axis_aligned.float().mean()
+
+        return is_centered & is_close_or_below & is_axis_aligned
 
     def _log_metrics(self, rew_dict, curr_successes):
         """Keep track of episode statistics and log rewards."""
@@ -427,7 +471,10 @@ class Fr3PegInsertEnv(DirectRLEnv):
                 torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
                 keypoint_offset.repeat(self.num_envs, 1),
             )[1]
+        held_axis, fixed_axis = self._get_asset_axes()
+        axis_alignment = torch.sum(held_axis * fixed_axis, dim=-1).abs()
         keypoint_dist = torch.norm(keypoints_held - keypoints_fixed, p=2, dim=-1).mean(-1)
+        xy_dist = torch.linalg.vector_norm(target_held_base_pos[:, 0:2] - held_base_pos[:, 0:2], dim=1)
 
         a0, b0 = self.cfg_task.keypoint_coef_baseline
         a1, b1 = self.cfg_task.keypoint_coef_coarse
@@ -443,6 +490,8 @@ class Fr3PegInsertEnv(DirectRLEnv):
             "kp_fine": utils.squashing_fn(keypoint_dist, a2, b2),
             "action_penalty_ee": action_penalty_ee,
             "action_grad_penalty": action_grad_penalty,
+            "xy_dist_penalty": xy_dist,
+            "axis_alignment": axis_alignment,
             "curr_engaged": curr_engaged.float(),
             "curr_success": curr_successes.float(),
         }
@@ -452,6 +501,8 @@ class Fr3PegInsertEnv(DirectRLEnv):
             "kp_fine": 1.0,
             "action_penalty_ee": -self.cfg_task.action_penalty_ee_scale,
             "action_grad_penalty": -self.cfg_task.action_grad_penalty_scale,
+            "xy_dist_penalty": -self.cfg_task.xy_dist_penalty_scale,
+            "axis_alignment": self.cfg_task.axis_alignment_scale,
             "curr_engaged": 1.0,
             "curr_success": 1.0,
         }
@@ -466,6 +517,8 @@ class Fr3PegInsertEnv(DirectRLEnv):
         self.step_sim_no_action()
 
         self.randomize_initial_state(env_ids)
+        if self._use_visuomotor_obs:
+            self._refresh_camera_views()
 
     def _set_assets_to_default_pose(self, env_ids):
         """Move assets to default pose before randomization."""
@@ -534,6 +587,21 @@ class Fr3PegInsertEnv(DirectRLEnv):
 
         return held_asset_relative_pos, held_asset_relative_quat
 
+    @staticmethod
+    def _quat_rotate(quat, vec):
+        """Rotate 3D vectors by quaternions in wxyz convention."""
+        quat_vec = quat[:, 1:4]
+        uv = torch.cross(quat_vec, vec, dim=-1)
+        uuv = torch.cross(quat_vec, uv, dim=-1)
+        return vec + 2.0 * (quat[:, 0:1] * uv + uuv)
+
+    def _get_asset_axes(self):
+        """Return world-frame local-z axes for the peg and hole."""
+        local_z = torch.tensor([0.0, 0.0, 1.0], device=self.device).repeat((self.num_envs, 1))
+        held_axis = self._quat_rotate(self.held_quat, local_z)
+        fixed_axis = self._quat_rotate(self.fixed_quat, local_z)
+        return held_axis, fixed_axis
+
     def _set_franka_to_default_pose(self, joints, env_ids):
         """Return Franka to its default joint position."""
         gripper_width = self.cfg_task.held_asset_cfg.diameter / 2 * 1.25
@@ -557,7 +625,7 @@ class Fr3PegInsertEnv(DirectRLEnv):
         reset at the same time.
         """
         self.scene.write_data_to_sim()
-        self.sim.step(render=False)
+        self.sim.step(render=self._use_visuomotor_obs)
         self.scene.update(dt=self.physics_dt)
         self._compute_intermediate_values(dt=self.physics_dt)
 
@@ -598,7 +666,7 @@ class Fr3PegInsertEnv(DirectRLEnv):
         fixed_asset_pos_noise = torch.randn((len(env_ids), 3), dtype=torch.float32, device=self.device)
         fixed_asset_pos_rand = torch.tensor(self.cfg.obs_rand.fixed_asset_pos, dtype=torch.float32, device=self.device)
         fixed_asset_pos_noise = fixed_asset_pos_noise @ torch.diag(fixed_asset_pos_rand)
-        self.init_fixed_pos_obs_noise[:] = fixed_asset_pos_noise
+        self.init_fixed_pos_obs_noise[env_ids] = fixed_asset_pos_noise
 
         self.step_sim_no_action()
 
@@ -614,7 +682,7 @@ class Fr3PegInsertEnv(DirectRLEnv):
             torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
             fixed_tip_pos_local,
         )
-        self.fixed_pos_obs_frame[:] = fixed_tip_pos
+        self.fixed_pos_obs_frame[env_ids] = fixed_tip_pos[env_ids]
 
         # (2) Move gripper to randomizes location above fixed asset. Keep trying until IK succeeds.
         # (a) get position vector to target
@@ -668,45 +736,65 @@ class Fr3PegInsertEnv(DirectRLEnv):
 
         self.step_sim_no_action()
 
-        # (3) Randomize asset-in-gripper location.
-        # flip gripper z orientation
-        flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        # (3) Sample the episode-level asset attach delta pose and place the asset at that pose.
+        num_resets = len(env_ids)
+        rand_sample = torch.rand((num_resets, 3), dtype=torch.float32, device=self.device)
+        held_asset_pos_noise = 2 * (rand_sample - 0.5)  # [-1, 1]
+
+        held_asset_pos_noise_level = torch.tensor(self.cfg_task.held_asset_pos_noise, device=self.device)
+        held_asset_pos_noise = held_asset_pos_noise @ torch.diag(held_asset_pos_noise_level)
+        self.held_asset_attach_delta_pos[env_ids] = held_asset_pos_noise
+
+        rand_sample = torch.rand((num_resets, 3), dtype=torch.float32, device=self.device)
+        held_asset_rot_noise = 2 * (rand_sample - 0.5)  # [-1, 1]
+        held_asset_rot_noise_level = torch.tensor(
+            self.cfg_task.held_asset_rot_noise_deg, dtype=torch.float32, device=self.device
+        )
+        held_asset_rot_noise = held_asset_rot_noise @ torch.diag(held_asset_rot_noise_level * np.pi / 180.0)
+        held_asset_rot_noise_quat = torch_utils.quat_from_euler_xyz(
+            roll=held_asset_rot_noise[:, 0],
+            pitch=held_asset_rot_noise[:, 1],
+            yaw=held_asset_rot_noise[:, 2],
+        )
+        self.held_asset_attach_delta_quat[env_ids] = held_asset_rot_noise_quat
+
+        # Place the pre-rotated held asset in the gripper before closing it.
+        flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(num_resets, 1)
         fingertip_flipped_quat, fingertip_flipped_pos = torch_utils.tf_combine(
-            q1=self.fingertip_midpoint_quat,
-            t1=self.fingertip_midpoint_pos,
+            q1=self.fingertip_midpoint_quat[env_ids],
+            t1=self.fingertip_midpoint_pos[env_ids],
             q2=flip_z_quat,
-            t2=torch.zeros((self.num_envs, 3), device=self.device),
+            t2=torch.zeros((num_resets, 3), device=self.device),
         )
 
         # get default gripper in asset transform
         held_asset_relative_pos, held_asset_relative_quat = self.get_handheld_asset_relative_pose()
         asset_in_hand_quat, asset_in_hand_pos = torch_utils.tf_inverse(
-            held_asset_relative_quat, held_asset_relative_pos
+            held_asset_relative_quat[env_ids], held_asset_relative_pos[env_ids]
         )
 
-        translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
-            q1=fingertip_flipped_quat, t1=fingertip_flipped_pos, q2=asset_in_hand_quat, t2=asset_in_hand_pos
+        held_quat, held_pos = torch_utils.tf_combine(
+            q1=fingertip_flipped_quat,
+            t1=fingertip_flipped_pos,
+            q2=asset_in_hand_quat,
+            t2=asset_in_hand_pos,
+        )
+        attach_pivot_pos = held_asset_relative_pos[env_ids]
+        rotated_pivot_pos = self._quat_rotate(self.held_asset_attach_delta_quat[env_ids], attach_pivot_pos)
+        pivoted_delta_pos = self.held_asset_attach_delta_pos[env_ids] + attach_pivot_pos - rotated_pivot_pos
+        held_quat, held_pos = torch_utils.tf_combine(
+            q1=held_quat,
+            t1=held_pos,
+            q2=self.held_asset_attach_delta_quat[env_ids],
+            t2=pivoted_delta_pos,
         )
 
-        # Add asset in hand randomization
-        rand_sample = torch.rand((self.num_envs, 3), dtype=torch.float32, device=self.device)
-        held_asset_pos_noise = 2 * (rand_sample - 0.5)  # [-1, 1]
-
-        held_asset_pos_noise_level = torch.tensor(self.cfg_task.held_asset_pos_noise, device=self.device)
-        held_asset_pos_noise = held_asset_pos_noise @ torch.diag(held_asset_pos_noise_level)
-        translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
-            q1=translated_held_asset_quat,
-            t1=translated_held_asset_pos,
-            q2=torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
-            t2=held_asset_pos_noise,
-        )
-
-        held_state = self._held_asset.data.default_root_state.clone()
-        held_state[:, 0:3] = translated_held_asset_pos + self.scene.env_origins
-        held_state[:, 3:7] = translated_held_asset_quat
+        held_state = self._held_asset.data.default_root_state.clone()[env_ids]
+        held_state[:, 0:3] = held_pos + self.scene.env_origins[env_ids]
+        held_state[:, 3:7] = held_quat
         held_state[:, 7:] = 0.0
-        self._held_asset.write_root_pose_to_sim(held_state[:, 0:7])
-        self._held_asset.write_root_velocity_to_sim(held_state[:, 7:])
+        self._held_asset.write_root_pose_to_sim(held_state[:, 0:7], env_ids=env_ids)
+        self._held_asset.write_root_velocity_to_sim(held_state[:, 7:], env_ids=env_ids)
         self._held_asset.reset()
 
         #  Close hand

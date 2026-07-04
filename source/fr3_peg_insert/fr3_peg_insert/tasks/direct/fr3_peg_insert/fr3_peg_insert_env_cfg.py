@@ -8,6 +8,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import TiledCameraCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg
 from isaaclab.utils import configclass
@@ -21,6 +22,7 @@ OBS_DIM_CFG = {
     "fingertip_quat": 4,
     "ee_linvel": 3,
     "ee_angvel": 3,
+    "held_axis_rel_fixed_axis": 3,
 }
 
 STATE_DIM_CFG = {
@@ -36,16 +38,10 @@ STATE_DIM_CFG = {
     "fixed_pos": 3,
     "fixed_quat": 4,
     "task_prop_gains": 6,
+    "ema_factor": 1,
     "pos_threshold": 3,
     "rot_threshold": 3,
 }
-
-
-@configclass
-class RobotCfg:
-    franka_fingerpad_length: float = 0.017608 - 0.008671
-    friction: float = 0.75
-
 
 @configclass
 class Peg20mm:
@@ -69,6 +65,12 @@ class Hole23mm:
 
 
 @configclass
+class RobotCfg:
+    franka_fingerpad_length: float = 0.017608 - 0.008671
+    friction: float = 0.75
+
+
+@configclass
 class PegInsert:
     robot_cfg: RobotCfg = RobotCfg()
     duration_s: float = 10.0
@@ -76,26 +78,35 @@ class PegInsert:
     fixed_asset_cfg: Hole23mm = Hole23mm()
     held_asset_cfg: Peg20mm = Peg20mm()
 
-    hand_init_pos: list = [0.0, 0.0, 0.047]
+    # Robot
+    hand_init_pos: list = [0.0, 0.0, 0.075]
     hand_init_pos_noise: list = [0.02, 0.02, 0.01]
     hand_init_orn: list = [3.1416, 0.0, 0.0]
     hand_init_orn_noise: list = [0.0, 0.0, 0.785]
 
+    # Fixed Asset
     fixed_asset_init_pos_noise: list = [0.05, 0.05, 0.0]
     fixed_asset_init_orn_deg: float = 0.0
     fixed_asset_init_orn_range_deg: float = 360.0
 
+    # Held Asset
     held_asset_pos_noise: list = [0.003, 0.0, 0.003]
+    held_asset_rot_noise_deg: list = [20.0, 20.0, 20.0]
 
+    # Reward
     action_penalty_ee_scale: float = 0.0
     action_grad_penalty_scale: float = 0.0
+    xy_dist_penalty_scale: float = 2.0
     num_keypoints: int = 4
     keypoint_scale: float = 0.15
     keypoint_coef_baseline: list = [5, 4]
     keypoint_coef_coarse: list = [50, 2]
     keypoint_coef_fine: list = [100, 0]
+    # Fraction of socket height.
     success_threshold: float = 0.04
     engage_threshold: float = 0.9
+    axis_alignment_scale: float = 1.0
+    success_axis_threshold: float = 0.95
 
     fixed_asset: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/FixedAsset",
@@ -160,7 +171,7 @@ class ObsRandCfg:
 class CtrlCfg:
     ema_factor = 0.2
 
-    pos_action_bounds = [0.05, 0.05, 0.05]
+    pos_action_bounds = [0.1, 0.1, 0.1]
 
     pos_action_threshold = [0.02, 0.02, 0.02]
     rot_action_threshold = [0.097, 0.097, 0.097]
@@ -183,7 +194,13 @@ class Fr3PegInsertEnvCfg(DirectRLEnvCfg):
     # num_*: will be overwritten to correspond to obs_order, state_order.
     observation_space = 21
     state_space = 72
-    obs_order: list = ["fingertip_pos_rel_fixed", "fingertip_quat", "ee_linvel", "ee_angvel"]
+    obs_order: list = [
+        "fingertip_pos_rel_fixed",
+        "fingertip_quat",
+        "ee_linvel",
+        "ee_angvel",
+        "held_axis_rel_fixed_axis",
+    ]
     state_order: list = [
         "fingertip_pos",
         "fingertip_quat",
@@ -295,3 +312,54 @@ class Fr3PegInsertEnvCfg(DirectRLEnvCfg):
             ),
         },
     )
+
+
+@configclass
+class Fr3PegInsertVisuomotorEnvCfg(Fr3PegInsertEnvCfg):
+    """Visuomotor variant that keeps object poses out of the policy input.
+
+    The policy receives robot proprioception and RGB images. Privileged peg/hole
+    state remains available through the critic state for asymmetric training.
+    """
+
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=128, env_spacing=2.0, replicate_physics=True)
+
+    obs_order: list = ["fingertip_quat", "ee_linvel", "ee_angvel"]
+
+    table_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/TableCamera",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(1.0, 0.0, 0.4),
+            rot=(0.62721, 0.32651, 0.32651, 0.62721),
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 2.0),
+        ),
+        width=200,
+        height=200,
+    )
+
+
+    wrist_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/fr3_hand/WristCamera",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.12, 0.0, -0.15),
+            rot=(0.09230, 0.70106, 0.70106, 0.09230),
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 2.0),
+        ),
+        width=200,
+        height=200,
+    )
+    image_obs_list: list = ["table_cam", "wrist_cam"]
